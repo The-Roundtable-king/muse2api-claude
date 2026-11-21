@@ -99,11 +99,12 @@ class MuseEngine:
         env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
         args = [
             self.cfg.chromium,
-            "--headless=new", "--no-sandbox", "--disable-gpu",
+            "--headless=new", "--no-sandbox",
             "--disable-dev-shm-usage", "--disable-background-networking",
             "--no-first-run", "--no-default-browser-check",
             "--autoplay-policy=no-user-gesture-required",
-            "--window-size=1440,2400",
+            "--window-size=1440,900",
+            "--disable-blink-features=AutomationControlled",
             f"--remote-debugging-port={self.cfg.cdp_port}",
             "--remote-allow-origins=*",
             f"--user-data-dir={self.cfg.profile_dir}",
@@ -213,6 +214,7 @@ class MuseEngine:
                         page.send("Runtime.enable")
                         page.send("Browser.setDownloadBehavior",
                                   {"behavior": "allow", "downloadPath": self.cfg.download_dir})
+                        self._inject_stealth(page)
                         return page
             except Exception as exc:
                 log.warning("Target.createBrowserContext 创建隔离上下文失败，回退到普通标签页: %s", exc)
@@ -227,7 +229,38 @@ class MuseEngine:
         page.send("Runtime.enable")
         page.send("Browser.setDownloadBehavior",
                   {"behavior": "allow", "downloadPath": self.cfg.download_dir})
+        self._inject_stealth(page)
         return page
+
+    def _inject_stealth(self, page: CDP):
+        """注入深度抗风控脚本：抹除 webdriver 特征、补充 window.chrome、模拟合法 Notification 探针。"""
+        stealth_js = """(function(){
+            try {
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            } catch(e){}
+            try {
+                window.chrome = {
+                    runtime: {},
+                    loadTimes: function() {},
+                    csi: function() {},
+                    app: {}
+                };
+            } catch(e){}
+            try {
+                if (window.navigator && window.navigator.permissions) {
+                    const origQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = (params) => (
+                        params && params.name === 'notifications' ?
+                            Promise.resolve({ state: Notification.permission }) :
+                            origQuery(params)
+                    );
+                }
+            } catch(e){}
+        })()"""
+        try:
+            page.send("Page.addScriptToEvaluateOnNewDocument", {"source": stealth_js})
+        except Exception:
+            pass
 
     @staticmethod
     def renew_session_http(cookies: dict, expires: dict | None = None,
@@ -235,12 +268,23 @@ class MuseEngine:
         """直接调用 muse.ai/api/session 续签 hatch_vml (+48h) / hatch_sess (+30d) / hatch_gw (+1y)，
         并按需调用 /api/hatch/vm/wake 唤醒云端工作区 VM。"""
         import requests
+        import platform
         cur_cookies = dict(cookies or {})
         cur_exp = dict(expires or {})
+        is_win = platform.system() == "Windows"
+        ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            if is_win else
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+        sec_platform = '"Windows"' if is_win else '"Linux"'
         headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "User-Agent": ua,
             "Origin": "https://muse.ai",
             "Referer": "https://muse.ai/thread/new",
+            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": sec_platform,
             "Sec-Fetch-Site": "same-origin",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty",
@@ -320,19 +364,33 @@ class MuseEngine:
                 exp_val = float(exp) if exp and float(exp) > now + 3600 else (now + 7 * 86400)
             except (TypeError, ValueError):
                 exp_val = now + 7 * 86400
-            for dom in (".muse.ai", "muse.ai"):
+            if name.startswith("__Host-"):
                 params = {
                     "name": name,
                     "value": value,
-                    "domain": dom,
+                    "url": "https://muse.ai",
                     "path": "/",
                     "secure": True,
                     "expires": exp_val,
                 }
                 try:
                     page.send("Network.setCookie", params)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
+            else:
+                for dom in (".muse.ai", "muse.ai"):
+                    params = {
+                        "name": name,
+                        "value": value,
+                        "domain": dom,
+                        "path": "/",
+                        "secure": True,
+                        "expires": exp_val,
+                    }
+                    try:
+                        page.send("Network.setCookie", params)
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def read_cookies(self) -> dict[str, dict]:
         """从当前页面读回 cookie（**包含 httpOnly**，这是网页 JS 做不到的）。
@@ -693,24 +751,14 @@ class MuseEngine:
     )
 
     def _send(self, prompt: str):
-        # 1. 确保 textarea 滚动到视口中央并获得真实焦点
-        try:
-            self.page.js("""(function(){
-                var ta = document.querySelector('textarea');
-                if (ta) {
-                    ta.scrollIntoView({block: 'center', inline: 'nearest'});
-                    ta.focus();
-                }
-            })()""")
-        except Exception:
-            pass
-        time.sleep(0.1)
-
-        rect = self.page.js(
-            "(function(){var t=document.querySelector('textarea');if(!t)return null;"
-            "var r=t.getBoundingClientRect();"
-            "return JSON.stringify({x:Math.round(r.left+r.width/2),"
-            "y:Math.round(r.top+r.height/2)});})()")
+        # 1. 确保 textarea 滚动到视口中央并通过真实物理鼠标点击获取焦点 (带 isTrusted=true)
+        rect = self.page.js("""(function(){
+            var ta = document.querySelector('textarea');
+            if (!ta) return null;
+            ta.scrollIntoView({block: 'center', inline: 'nearest'});
+            var r = ta.getBoundingClientRect();
+            return JSON.stringify({x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2)});
+        })()""")
         if not rect:
             raise MuseGenerationError("找不到聊天输入框")
         c = json.loads(rect)
@@ -718,44 +766,62 @@ class MuseEngine:
             self.page.send("Input.dispatchMouseEvent",
                            {"type": t, "x": c["x"], "y": c["y"],
                             "button": "left", "clickCount": 1})
-        time.sleep(0.1)
+        time.sleep(0.08)
 
-        # 触发 React 18 原型 setter 以及 input/change 事件以同步发送按钮状态
-        # （对于 DeepSeek/Codex 等 100KB+ 超长上下文，直接走原型 setter 仅需 <1s，避免 Input.insertText 逐字注入卡死）
-        _SETTER_JS = (
-            "(function(t){var ta=document.querySelector('textarea');"
-            "if(!ta) return 0;"
-            "ta.focus();"
-            "var s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
-            "s.call(ta,t);"
-            "ta.dispatchEvent(new Event('input',{bubbles:true}));"
-            "ta.dispatchEvent(new Event('change',{bubbles:true}));"
-            "return (ta.value||'').length;})(%s)")
-        val_len = self.page.js(_SETTER_JS % json.dumps(prompt)) or 0
-        if not val_len and len(prompt) < 500:
+        # 2. 文本输入：短文本走 CDP 硬件 insertText，长文本模拟真人 ClipboardEvent('paste') 粘贴
+        if len(prompt) < 1000:
             self.page.send("Input.insertText", {"text": prompt})
-            self.page.js(_SETTER_JS % json.dumps(prompt))
+        else:
+            # 模拟大段代码的合法 paste 粘贴行为，杜绝单纯 setter 引起动力学模型异常
+            self.page.js("""(function(text) {
+                var ta = document.querySelector('textarea');
+                if (!ta) return;
+                try {
+                    var dt = new DataTransfer();
+                    dt.setData('text/plain', text);
+                    var pasteEvt = new ClipboardEvent('paste', {
+                        clipboardData: dt, bubbles: true, cancelable: true
+                    });
+                    ta.dispatchEvent(pasteEvt);
+                } catch(e){}
+                var s = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+                s.call(ta, text);
+                ta.dispatchEvent(new Event('input', {bubbles: true}));
+                ta.dispatchEvent(new Event('change', {bubbles: true}));
+            })(%s)""" % json.dumps(prompt))
+        time.sleep(0.15)
 
-        # 等待发送按钮就绪并点击
-        clicked = "no-button"
+        # 3. 发送按钮点击加固：严禁 b.click()，必须获取物理坐标后走 CDP 原生鼠标事件 (保证 isTrusted=true)
+        btn_rect = None
         t_deadline = time.time() + 3.0
         while time.time() < t_deadline:
-            res = self.page.js(
-                "(function(){var b=[...document.querySelectorAll('button,[role=button]')]"
-                ".filter(function(x){return x.offsetParent!==null;})"
-                ".find(function(x){return /发送|send/i.test(x.getAttribute('aria-label')||'')"
-                "||/发送|send/i.test(x.getAttribute('data-testid')||'')"
-                "||/send/i.test(x.innerText||'');});"
-                "if(!b)return 'no-button';"
-                "if(b.disabled)return 'disabled';"
-                "b.click();return 'clicked';})()")
-            if res == "clicked":
-                clicked = "clicked"
+            raw = self.page.js("""(function(){
+                var b = [...document.querySelectorAll('button,[role=button]')]
+                    .filter(function(x){ return x.offsetParent !== null; })
+                    .find(function(x){
+                        return /发送|send/i.test(x.getAttribute('aria-label')||'')
+                            || /发送|send/i.test(x.getAttribute('data-testid')||'')
+                            || /send/i.test(x.innerText||'');
+                    });
+                if (!b || b.disabled) return null;
+                var r = b.getBoundingClientRect();
+                return JSON.stringify({x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2)});
+            })()""")
+            if raw:
+                btn_rect = json.loads(raw)
                 break
             time.sleep(0.08)
 
-        if clicked != "clicked":
-            # 兜底：Ctrl+Enter 或普通 Enter
+        clicked = "no-button"
+        if btn_rect:
+            for t in ("mousePressed", "mouseReleased"):
+                self.page.send("Input.dispatchMouseEvent", {
+                    "type": t, "x": btn_rect["x"], "y": btn_rect["y"],
+                    "button": "left", "clickCount": 1
+                })
+            clicked = "clicked"
+        else:
+            # 兜底：CDP 物理键盘回车
             for combo in ({"modifiers": 1}, {}):
                 for t in ("keyDown", "char", "keyUp"):
                     params = {"type": t, "key": "Enter", "code": "Enter",
@@ -765,14 +831,14 @@ class MuseEngine:
                         params["text"] = "\r"
                         params["unmodifiedText"] = "\r"
                     self.page.send("Input.dispatchKeyEvent", params)
-                time.sleep(1.0)
+                time.sleep(0.5)
                 try:
                     if self.page.js("!(document.querySelector('textarea')||{value:''}).value"):
                         clicked = "enter-sent"
                         break
                 except Exception:
                     pass
-        time.sleep(0.3)
+        time.sleep(0.2)
         return clicked
 
     # ---------------- 等待生成 ----------------

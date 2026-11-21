@@ -48,6 +48,9 @@ muse2api-profiles/
 *.bak
 *.bak*
 *.swp
+service_runner.py
+start_service.bat
+scratch/
 *~
 
 # IDE & OS
