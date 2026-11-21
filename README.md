@@ -3,6 +3,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Anthropic-Messages%20API-8A2BE2?logo=anthropic" alt="Anthropic Messages API" />
   <img src="https://img.shields.io/badge/Claude%20Code-Ready-blueviolet?logo=anthropic" alt="Claude Code Ready" />
+  <a href="docs/audit_reports.md"><img src="https://img.shields.io/badge/Security%20Audit-96%2F100%20(PASS)-brightgreen" alt="Security Audit" /></a>
   <img src="https://img.shields.io/badge/Anti--Abuse-Industrial%20Stealth-success" alt="Anti-Abuse Stealth" />
   <img src="https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi" alt="FastAPI" />
   <img src="https://img.shields.io/badge/License-MIT-orange" alt="License" />
@@ -17,7 +18,9 @@
 
 市面上大部分开源逆向反代停留在“能跑通即可”的初级水平，在面对现代大厂（Cloudflare Turnstile、DataDome、Akamai 及平台自研反作弊模型）的前端行为探针与设备指纹比对时，破绽百出。
 
-本项目在保留多模态逆向能力的基础上，**由资深风控安全对抗视角重构了底层输入链路与生命周期管理**：
+本项目在保留多模态逆向能力的基础上，**由资深风控安全对抗视角重构了底层输入链路与生命周期管理**。
+
+> 📑 **官方红蓝对抗审计白皮书**：本项目在发布前经历资深反作弊架构师两轮实战穿透审计，初审 64 分扒出 3 项致命漏洞，针对性加固后终审斩获 **96/100 分**并获官方绿灯批准发布。完整攻防实录见 [《风控穿透与二次回归审计白皮书 (docs/audit_reports.md)》](docs/audit_reports.md)。
 
 ### ⚔️ 市面普通逆向 vs 本项目工业级高防装甲对比
 
